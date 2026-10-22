@@ -18,24 +18,39 @@ $expectedBlue = @('Mrkrabs','Spongebob','Squidward','Patrick','Sandy','gary','pu
 $protectedGrey = @('kingneptune','paintythepirate','greyteamadmin')
 $expected = @($originalLocal + $expectedBlue + $protectedGrey) | Select-Object -Unique
 Write-Audit "Started local account audit on $env:COMPUTERNAME. RotationRequested=$RotateApprovedPasswords"
+$users = @()
+$usersAvailable = $false
 try {
     $users = @(Get-LocalUser)
+    $usersAvailable = $true
     Write-Audit ('Local account count: {0}' -f $users.Count)
     foreach ($user in $users) {
         if ($user.Name -notin $expected) {
             Write-Audit "UNEXPECTED LOCAL USER: $($user.Name) (enabled=$($user.Enabled))"
         }
     }
-    Write-Audit 'Grey Team accounts and groups will not be modified.'
-    $members = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
-    foreach ($member in $members) {
-        Write-Audit "ADMIN GROUP MEMBER: $($member.Name)"
+} catch {
+    Write-Audit "ERROR during local user inventory; continuing with remaining checks: $($_.Exception.Message)"
+}
+Write-Audit 'Grey Team accounts and groups will not be modified.'
+try {
+    $adminGroup = Get-LocalGroup -ErrorAction Stop |
+        Where-Object { $_.SID.Value -eq 'S-1-5-32-544' } |
+        Select-Object -First 1
+    if (-not $adminGroup) {
+        Write-Audit 'Administrators group not found; skipping group-member check.'
+    } else {
+        $members = @(Get-LocalGroupMember -Group $adminGroup.Name -ErrorAction Stop)
+        foreach ($member in $members) {
+            Write-Audit "ADMIN GROUP MEMBER: $($member.Name)"
+        }
     }
 } catch {
-    Write-Audit "ERROR during inventory: $($_.Exception.Message)"
-    throw
+    Write-Audit "ERROR during Administrators group check; continuing: $($_.Exception.Message)"
 }
-if ($RotateApprovedPasswords) {
+if ($RotateApprovedPasswords -and -not $usersAvailable) {
+    Write-Audit 'SKIPPED password rotation because local user inventory failed.'
+} elseif ($RotateApprovedPasswords) {
     # Only explicit, authorized local account allowlist. Never domain accounts.
     $rotationTargets = @('Administrator','Admin','jellyfish')
     $oldPassword = Read-Host 'Enter old password to verify for each eligible account' -AsSecureString
