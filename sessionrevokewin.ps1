@@ -3,12 +3,9 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-# Sign out every local Windows interactive session for the account running this
-# script. Logging off a Windows session closes its cmd.exe and PowerShell
-# processes regardless of profile loading. This does not revoke tokens or
-# sessions on other computers/servers, nor SSH connections hosted by sshd.
+# List local Windows interactive sessions and allow selected sessions to be
+# signed out. This does not affect sessions on other computers/servers or SSH.
 $currentSessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
-$account = $env:USERNAME
 
 $quser = Join-Path $env:SystemRoot 'System32\quser.exe'
 $logoff = Join-Path $env:SystemRoot 'System32\logoff.exe'
@@ -20,28 +17,50 @@ if ($LASTEXITCODE -ne 0) {
 $sessions = foreach ($line in ($output | Select-Object -Skip 1)) {
 	# quser rows may include a leading current-session marker and may omit the
 	# session name for disconnected sessions.
-	if ($line -match '^\s*>?\s*(\S+)\s+(?:(\S+)\s+)?(\d+)\s+\S+') {
-		$rowAccount = ($Matches[1] -split '\\')[-1]
-		if ($rowAccount -ieq $account) {
-			[int]$Matches[3]
+	if ($line -match '^\s*>?\s*(\S+)\s+(?:(\S+)\s+)?(\d+)\s+(\S+)') {
+		[pscustomobject]@{
+			User        = $Matches[1]
+			SessionName = $Matches[2]
+			Id          = [int]$Matches[3]
+			State       = $Matches[4]
 		}
 	}
 }
 
-$sessions = @($sessions | Sort-Object -Unique)
-if ($sessions.Count -eq 0 -or $currentSessionId -notin $sessions) {
-	throw "No matching interactive sessions found for '$account'; nothing was logged off."
+if (@($sessions).Count -eq 0) {
+	throw 'No interactive Windows sessions were found.'
 }
 
-Write-Host "Sessions for '$account' that will be signed out: $($sessions -join ', ')"
-Write-Host 'This closes applications and discards unsaved work. Other accounts are not affected.'
+Write-Host 'Logged-in Windows sessions:'
+$sessions | Format-Table User, SessionName, Id, State -AutoSize | Out-Host
+$choice = Read-Host 'Enter session IDs separated by commas, or ALL to select every session'
+if ($choice -ceq 'ALL') {
+	$selected = @($sessions)
+}
+else {
+	$ids = @($choice -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+	if ($ids.Count -eq 0 -or @($ids | Where-Object { $_ -notmatch '^\d+$' }).Count -gt 0) {
+		throw 'Enter one or more listed session IDs, or ALL.'
+	}
+	$requestedIds = @($ids | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+	$selected = @($sessions | Where-Object { $_.Id -in $requestedIds })
+	if ($selected.Count -ne $requestedIds.Count) {
+		throw 'One or more IDs were not listed; no sessions were signed out.'
+	}
+}
+
+Write-Host "Sessions selected for sign-out: $(($selected | ForEach-Object { "$($_.User) (ID $($_.Id))" }) -join ', ')"
 if ((Read-Host 'Type LOGOFF to continue') -cne 'LOGOFF') {
-	Write-Host 'Cancelled; no sessions were ended.'
+	Write-Host 'Cancelled; no sessions were signed out.'
 	exit 0
 }
 
 # Sign out the current session last so this script can process the remaining IDs.
-$orderedSessions = @($sessions | Where-Object { $_ -ne $currentSessionId }) + $currentSessionId
+$selectedIds = @($selected | ForEach-Object { $_.Id })
+$orderedSessions = @($selectedIds | Where-Object { $_ -ne $currentSessionId })
+if ($currentSessionId -in $selectedIds) {
+	$orderedSessions += $currentSessionId
+}
 $failed = @()
 foreach ($id in $orderedSessions) {
 	& $logoff $id
