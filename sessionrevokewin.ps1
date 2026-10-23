@@ -85,21 +85,21 @@ if (@($sessions).Count -eq 0) {
 
 Write-Host 'Logged-in Windows sessions:'
 $sessions | Format-Table User, SessionName, Id, State, OriginIP -AutoSize | Out-Host
-$choice = Read-Host 'Enter session IDs separated by commas, or ALL to select every session'
-if ($choice -ceq 'ALL') {
-	$selected = @($sessions)
-}
-else {
-	$ids = @($choice -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-	if ($ids.Count -eq 0 -or @($ids | Where-Object { $_ -notmatch '^\d+$' }).Count -gt 0) {
-		throw 'Enter one or more listed session IDs, or ALL.'
-	}
-	$requestedIds = @($ids | ForEach-Object { [int]$_ } | Sort-Object -Unique)
-	$selected = @($sessions | Where-Object { $_.Id -in $requestedIds })
-	if ($selected.Count -ne $requestedIds.Count) {
-		throw 'One or more IDs were not listed; no sessions were signed out.'
-	}
-}
+#$choice = Read-Host 'Enter session IDs separated by commas, or ALL to select every session'
+#if ($choice -ceq 'ALL') {
+$selected = @($sessions)
+#}
+#else {
+#	$ids = @($choice -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+#	if ($ids.Count -eq 0 -or @($ids | Where-Object { $_ -notmatch '^\d+$' }).Count -gt 0) {
+#		throw 'Enter one or more listed session IDs, or ALL.'
+#	}
+#	$requestedIds = @($ids | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+#	$selected = @($sessions | Where-Object { $_.Id -in $requestedIds })
+#	if ($selected.Count -ne $requestedIds.Count) {
+#		throw 'One or more IDs were not listed; no sessions were signed out.'
+#	}
+#}
 
 Write-Host "Sessions selected for sign-out: $(($selected | ForEach-Object { "$($_.User) (ID $($_.Id))" }) -join ', ')"
 
