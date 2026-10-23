@@ -102,10 +102,7 @@ else {
 }
 
 Write-Host "Sessions selected for sign-out: $(($selected | ForEach-Object { "$($_.User) (ID $($_.Id))" }) -join ', ')"
-if ((Read-Host 'Type LOGOFF to continue') -cne 'LOGOFF') {
-	Write-Host 'Cancelled; no sessions were signed out.'
-	exit 0
-}
+
 
 # Sign out the current session last so this script can process the remaining IDs.
 $selectedIds = @($selected | ForEach-Object { $_.Id })
