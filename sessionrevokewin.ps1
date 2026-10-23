@@ -103,6 +103,52 @@ $selected = @($sessions)
 
 Write-Host "Sessions selected for sign-out: $(($selected | ForEach-Object { "$($_.User) (ID $($_.Id))" }) -join ', ')"
 
+# Close active inbound OpenSSH sessions without stopping the sshd service.
+$sshdService = Get-CimInstance Win32_Service -Filter "Name='sshd'"
+if ($null -eq $sshdService -or $sshdService.State -ne 'Running') {
+	Write-Host 'No running OpenSSH server service was found; no SSH sessions to close.'
+}
+else {
+	$sshdProcessId = [int]$sshdService.ProcessId
+	$sshListenerPorts = @(
+		Get-NetTCPConnection -State Listen |
+			Where-Object { $_.OwningProcess -eq $sshdProcessId } |
+			Select-Object -ExpandProperty LocalPort -Unique
+	)
+	$sshSessionProcessIds = @(
+		Get-NetTCPConnection -State Established |
+			Where-Object { $_.LocalPort -in $sshListenerPorts -and $_.OwningProcess -ne $sshdProcessId } |
+			Select-Object -ExpandProperty OwningProcess -Unique
+	)
+	$sshdProcesses = @(Get-CimInstance Win32_Process -Filter "Name='sshd.exe'")
+	$sshSessionProcessIds = @(
+		$sshSessionProcessIds | Where-Object {
+			$sessionProcessId = $_
+			@($sshdProcesses | Where-Object { $_.ProcessId -eq $sessionProcessId }).Count -gt 0
+		}
+	)
+
+	if ($sshSessionProcessIds.Count -eq 0) {
+		Write-Host 'No active inbound SSH sessions were found.'
+	}
+	else {
+		Write-Host "Closing inbound SSH session process(es): $($sshSessionProcessIds -join ', ')"
+		$failedSshProcessIds = @()
+		foreach ($sshSessionProcessId in $sshSessionProcessIds) {
+			try {
+				Stop-Process -Id $sshSessionProcessId -Force -ErrorAction Stop
+			}
+			catch {
+				$failedSshProcessIds += $sshSessionProcessId
+				Write-Warning "Could not close SSH session process ${sshSessionProcessId}: $($_.Exception.Message)"
+			}
+		}
+
+		if ($failedSshProcessIds.Count -gt 0) {
+			throw "Failed to close SSH session process(es): $($failedSshProcessIds -join ', '). Run elevated or contact your administrator."
+		}
+	}
+}
 
 # Sign out the current session last so this script can process the remaining IDs.
 $selectedIds = @($selected | ForEach-Object { $_.Id })
