@@ -1,97 +1,95 @@
-param(
-	[int]$LookbackHours = 24,
-	[int]$PollSeconds = 5,
-	[switch]$Once,
-	[string]$OutputPath = (Join-Path $PSScriptRoot 'ip-connections.csv')
-)
-
-# Run elevated for Security and Windows Firewall events. Firewall connection
-# auditing (Security events 5156/5157) must be enabled to record arbitrary ports.
-$ErrorActionPreference = 'SilentlyContinue'
-$seen = @{}
-$knownServices = @{ 22 = 'SSH'; 3389 = 'RDP' }
-
-function Get-EventFields($Event) {
-	$fields = @{}
-	$xml = [xml]$Event.ToXml()
-	foreach ($item in $xml.Event.EventData.Data) {
-		$fields[$item.GetAttribute('Name')] = $item.InnerText
-	}
-	return $fields
+# Requires Administrator privileges to read Security Event Logs
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning "Please run this script as an Administrator to query Security logs."
+    Exit
 }
 
-function Add-ConnectionLog($Key, $Time, $RemoteIP, $RemotePort, $LocalPort, $Service, $Source) {
-	if ([string]::IsNullOrWhiteSpace($RemoteIP) -or $RemoteIP -in @('-', '::', '0.0.0.0', '127.0.0.1', '::1')) { return }
-	if ($seen.ContainsKey($Key)) { return }
-	$seen[$Key] = $true
+$OutputFile = "$Home\Desktop\historical_connections.txt"
+$Results = @()
 
-	if ($Service -eq 'Unknown' -and $LocalPort -match '^\d+$' -and $knownServices.ContainsKey([int]$LocalPort)) {
-		$Service = $knownServices[[int]$LocalPort]
-	}
-	[pscustomobject]@{
-		Time = $Time
-		RemoteIP = $RemoteIP
-		RemotePort = $RemotePort
-		LocalPort = $LocalPort
-		Service = $Service
-		Source = $Source
-	} | Export-Csv -Path $OutputPath -NoTypeInformation -Append
-	Write-Host ("{0:u} {1} -> local port {2} ({3}) [{4}]" -f $Time, $RemoteIP, $LocalPort, $Service, $Source)
+Write-Host "Searching Event Logs for past IP connections (Network, RDP, and SSH)..." -ForegroundColor Cyan
+
+# 1. Query Security Log for Network Logons (Event 4624, Logon Type 3 - Network sharing, etc.)
+try {
+    $NetworkLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624} -ErrorAction SilentlyContinue
+    foreach ($Event in $NetworkLogons) {
+        $XML = [xml]$Event.ToXml()
+        $LogonType = $XML.Event.EventData.Data | Where-Object {$_.Name -eq "LogonType"} | Select-Object -ExpandProperty "#text"
+        $IpAddress = $XML.Event.EventData.Data | Where-Object {$_.Name -eq "IpAddress"} | Select-Object -ExpandProperty "#text"
+        $Username  = $XML.Event.EventData.Data | Where-Object {$_.Name -eq "TargetUserName"} | Select-Object -ExpandProperty "#text"
+
+        if ($LogonType -eq "3" -and $IpAddress -and $IpAddress -ne "-" -and $IpAddress -ne "127.0.0.1" -and $IpAddress -ne "::1") {
+            $Results += [PSCustomObject]@{
+                Time           = $Event.TimeCreated
+                IPAddress      = $IpAddress
+                UserOrService  = $Username
+                ConnectionType = "Network Logon (SMB/Share)"
+            }
+        }
+    }
+} catch {
+    Write-Warning "Could not query Security Log. Ensure Auditing is enabled."
 }
 
-function Read-ConnectionEvents($Since) {
-	$sources = @(
-		@{ Log = 'Security'; Ids = @(5156, 5157, 4624) },
-		@{ Log = 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; Ids = @(1149) },
-		@{ Log = 'OpenSSH/Operational'; Ids = @(4, 5) }
-	)
+# 2. Query Remote Desktop (RDP) Operational Log (Event 1149 - Established network connection)
+try {
+    $RdpLogons = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; Id=1149} -ErrorAction SilentlyContinue
+    foreach ($Event in $RdpLogons) {
+        $XML = [xml]$Event.ToXml()
+        $Username  = $XML.Event.EventData.Data | Where-Object {$_.Name -eq "Param1"} | Select-Object -ExpandProperty "#text"
+        $IpAddress = $XML.Event.EventData.Data | Where-Object {$_.Name -eq "Param3"} | Select-Object -ExpandProperty "#text"
 
-	foreach ($source in $sources) {
-		$events = Get-WinEvent -FilterHashtable @{ LogName = $source.Log; Id = $source.Ids; StartTime = $Since } -ErrorAction SilentlyContinue
-		foreach ($event in $events) {
-			$key = "$($source.Log):$($event.RecordId)"
-			if ($seen.ContainsKey($key)) { continue }
-			$f = Get-EventFields $event
-			$remote = ''; $remotePort = ''; $localPort = ''; $service = 'Unknown'
-
-			if ($event.Id -in @(5156, 5157)) {
-				if ($f.Direction -notin @('%%14592', 'Inbound', '1')) { continue }
-				$remote = $f.SourceAddress; $remotePort = $f.SourcePort; $localPort = $f.DestPort
-			} elseif ($event.Id -eq 1149) {
-				$remote = $f.Param3
-				if (-not $remote) { $remote = [regex]::Match($event.Message, '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])').Value }
-				$localPort = '3389'; $service = 'RDP'
-			} elseif ($event.Id -eq 4624) {
-				if ($f.LogonType -notin @('3', '10')) { continue }
-				$remote = $f.IpAddress; $remotePort = $f.IpPort
-				if ($f.LogonType -eq '10') { $localPort = '3389'; $service = 'RDP' }
-			} else {
-				$remote = [regex]::Match($event.Message, '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])').Value
-				if (-not $remote) { $remote = [regex]::Match($event.Message, '(?<![\w:])(?:[A-Fa-f0-9]{0,4}:){2,}[A-Fa-f0-9:]{2,}(?![\w:])').Value }
-				if ($remote) { $localPort = '22'; $service = 'SSH' }
-			}
-
-			Add-ConnectionLog $key $event.TimeCreated $remote $remotePort $localPort $service $source.Log
-		}
-	}
+        if ($IpAddress -and $IpAddress -ne "127.0.0.1" -and $IpAddress -ne "::1") {
+            $Results += [PSCustomObject]@{
+                Time           = $Event.TimeCreated
+                IPAddress      = $IpAddress
+                UserOrService  = $Username
+                ConnectionType = "Remote Desktop (RDP)"
+            }
+        }
+    }
+} catch {
+    Write-Warning "Could not query RDP operational logs."
 }
 
-if (-not (Test-Path $OutputPath)) {
-	'Time,RemoteIP,RemotePort,LocalPort,Service,Source' | Set-Content -Path $OutputPath
+# 3. Query OpenSSH Operational Log (Event 4 - Successful connection/authentication)
+try {
+    $SshLogons = Get-WinEvent -FilterHashtable @{LogName='OpenSSH/Operational'; Id=4} -ErrorAction SilentlyContinue
+    foreach ($Event in $SshLogons) {
+        $XML = [xml]$Event.ToXml()
+        # OpenSSH packs metadata into a single Message string or raw data payload depending on version
+        $Message = $Event.Message
+        
+        # Parse out Username and IP using basic regex matching from standard OpenSSH event strings
+        if ($Message -match "Accepted\s+(\S+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port") {
+            $Username  = $Matches[2]
+            $IpAddress = $Matches[3]
+        } elseif ($Message -match "Authorized\s+to\s+(\S+)\s+from\s+(\S+)\s+port") {
+            $Username  = $Matches[1]
+            $IpAddress = $Matches[2]
+        } else {
+            # Fallback string split if precise regex match drops out
+            $IpAddress = $XML.Event.UserData.OpenSSH | Select-Object -ExpandProperty "SourceAddress"
+            $Username  = $XML.Event.UserData.OpenSSH | Select-Object -ExpandProperty "Username"
+        }
+
+        if ($IpAddress -and $IpAddress -ne "127.0.0.1" -and $IpAddress -ne "::1") {
+            $Results += [PSCustomObject]@{
+                Time           = $Event.TimeCreated
+                IPAddress      = $IpAddress
+                UserOrService  = $Username
+                ConnectionType = "Secure Shell (SSH)"
+            }
+        }
+    }
+} catch {
+    Write-Warning "Could not query OpenSSH operational logs. Ensure Windows OpenSSH feature is running."
 }
 
-# Record connections already established when the script starts.
-foreach ($connection in (Get-NetTCPConnection -State Established)) {
-	$service = 'Unknown'
-	if ($knownServices.ContainsKey([int]$connection.LocalPort)) { $service = $knownServices[[int]$connection.LocalPort] }
-	$key = "active:$($connection.LocalAddress):$($connection.LocalPort):$($connection.RemoteAddress):$($connection.RemotePort)"
-	Add-ConnectionLog $key (Get-Date) $connection.RemoteAddress $connection.RemotePort $connection.LocalPort $service 'Active TCP connection'
-}
-
-Read-ConnectionEvents (Get-Date).AddHours(-$LookbackHours)
-if (-not $Once) {
-	while ($true) {
-		Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
-		Read-ConnectionEvents (Get-Date).AddMinutes(-2)
-	}
+# Output Consolidated Results to Text File
+if ($Results) {
+    $Results | Sort-Object Time -Descending | Format-Table -AutoSize | Out-File -FilePath $OutputFile -Width 300
+    Write-Host "Success! Consolidated connection history saved to: $OutputFile" -ForegroundColor Green
+} else {
+    Write-Host "No historical connections found for SMB, RDP, or SSH." -ForegroundColor Yellow
 }
